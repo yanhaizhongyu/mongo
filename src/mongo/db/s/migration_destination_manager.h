@@ -154,15 +154,11 @@ private:
      *
      * Overlapping pending ranges will be removed, so it is only safe to use this when you know
      * your metadata view is definitive, such as at the start of a migration.
-     *
-     * TODO: Because migrations may currently be active when a collection drops, an epoch is
-     * necessary to ensure the pending metadata change is still applicable.
      */
-    Status _notePending(OperationContext* opCtx,
-                        const NamespaceString& nss,
-                        const BSONObj& min,
-                        const BSONObj& max,
-                        const OID& epoch);
+    Status _beginReceive(OperationContext* opCtx,
+                         const NamespaceString& nss,
+                         const BSONObj& min,
+                         const BSONObj& max);
 
     /**
      * Stops tracking a chunk range between 'min' and 'max' that previously was having data
@@ -170,15 +166,11 @@ private:
      *
      * To avoid removing pending ranges of other operations, ensure that this is only used when
      * a migration is still active.
-     *
-     * TODO: Because migrations may currently be active when a collection drops, an epoch is
-     * necessary to ensure the pending metadata change is still applicable.
      */
-    Status _forgetPending(OperationContext* opCtx,
-                          const NamespaceString& nss,
-                          const BSONObj& min,
-                          const BSONObj& max,
-                          const OID& epoch);
+    void _forgetReceive(OperationContext* opCtx,
+                        const NamespaceString& nss,
+                        const BSONObj& min,
+                        const BSONObj& max);
 
     /**
      * Checks whether the MigrationDestinationManager is currently handling a migration by checking

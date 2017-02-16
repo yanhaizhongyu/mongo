@@ -51,6 +51,7 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/collection_metadata.h"
+#include "mongo/db/s/collection_range_deleter.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/move_timing_helper.h"
@@ -59,6 +60,7 @@
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/stdx/chrono.h"
+#include "mongo/util/concurrency/notification.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -421,11 +423,7 @@ void MigrationDestinationManager::_migrateThread(BSONObj min,
     }
 
     if (getState() != DONE) {
-        // Unprotect the range if needed/possible on unsuccessful TO migration
-        Status status = _forgetPending(opCtx.get(), _nss, min, max, epoch);
-        if (!status.isOK()) {
-            warning() << "Failed to remove pending range" << redact(causedBy(status));
-        }
+        _forgetReceive(opCtx.get(), _nss, min, max);
     }
 
     stdx::lock_guard<stdx::mutex> lk(_mutex);
@@ -602,27 +600,10 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* opCtx,
     }
 
     {
-        // 2. Synchronously delete any data which might have been left orphaned in range
-        // being moved
+        // 2. Synchronously delete any data which might have been left orphaned in the range
+        // being moved, and wait for completion
 
-        RangeDeleterOptions deleterOptions(
-            KeyRange(_nss.ns(), min.getOwned(), max.getOwned(), shardKeyPattern));
-        deleterOptions.writeConcern = writeConcern;
-
-        // No need to wait since all existing cursors will filter out this range when returning
-        // the results
-        deleterOptions.waitForOpenCursors = false;
-        deleterOptions.fromMigrate = true;
-        deleterOptions.onlyRemoveOrphanedDocs = true;
-        deleterOptions.removeSaverReason = "preCleanup";
-
-        if (!getDeleter()->deleteNow(opCtx, deleterOptions, &_errmsg)) {
-            warning() << "Failed to queue delete for migrate abort: " << redact(_errmsg);
-            setState(FAIL);
-            return;
-        }
-
-        Status status = _notePending(opCtx, _nss, min, max, epoch);
+        Status status = _beginReceive(opCtx, _nss, min, max);
         if (!status.isOK()) {
             _errmsg = status.reason();
             setState(FAIL);
@@ -990,80 +971,43 @@ bool MigrationDestinationManager::_flushPendingWrites(OperationContext* opCtx,
     return true;
 }
 
-Status MigrationDestinationManager::_notePending(OperationContext* opCtx,
-                                                 const NamespaceString& nss,
-                                                 const BSONObj& min,
-                                                 const BSONObj& max,
-                                                 const OID& epoch) {
-    AutoGetCollection autoColl(opCtx, nss, MODE_IX, MODE_X);
-
-    auto css = CollectionShardingState::get(opCtx, nss);
-    auto metadata = css->getMetadata();
-
-    // This can currently happen because drops aren't synchronized with in-migrations.  The idea
-    // for checking this here is that in the future we shouldn't have this problem.
-    if (!metadata || metadata->getCollVersion().epoch() != epoch) {
-        return {ErrorCodes::StaleShardVersion,
-                str::stream() << "could not note chunk [" << min << "," << max << ")"
-                              << " as pending because the epoch for "
-                              << nss.ns()
-                              << " has changed from "
-                              << epoch
-                              << " to "
-                              << (metadata ? metadata->getCollVersion().epoch()
-                                           : ChunkVersion::UNSHARDED().epoch())};
-    }
-
-    css->beginReceive(ChunkRange(min, max));
-
-    stdx::lock_guard<stdx::mutex> sl(_mutex);
-    invariant(!_chunkMarkedPending);
-    _chunkMarkedPending = true;
-
-    return Status::OK();
-}
-
-Status MigrationDestinationManager::_forgetPending(OperationContext* opCtx,
-                                                   const NamespaceString& nss,
-                                                   const BSONObj& min,
-                                                   const BSONObj& max,
-                                                   const OID& epoch) {
+Status MigrationDestinationManager::_beginReceive(OperationContext* opCtx,
+                                                  const NamespaceString& nss,
+                                                  const BSONObj& min,
+                                                  const BSONObj& max) {
+    ChunkRange footprint(min, max);
     {
-        stdx::lock_guard<stdx::mutex> sl(_mutex);
-        if (!_chunkMarkedPending) {
+        AutoGetCollection autoColl(opCtx, nss, MODE_IX, MODE_X);
+        if (autoColl.getCollection() == nullptr) {
             return Status::OK();
         }
+        auto css = CollectionShardingState::get(opCtx, nss);
 
-        _chunkMarkedPending = false;
+        // start clearing any leftovers that would be in the new chunk
+        if (!css->beginReceive(footprint)) {
+            // TODO: assign a stable code
+            return {ErrorCodes::Error(17377),  // ErrorCodes::RangeMayBeInUse,
+                    str::stream() << "Collection " << nss.ns() << " range [" << redact(min) << ", "
+                                  << redact(max)
+                                  << ") migration aborted; documents in range may still"
+                                     "  be in use on the destination shard."};
+        }
     }
 
-    AutoGetCollection autoColl(opCtx, nss, MODE_IX, MODE_X);
+    return CollectionShardingState::waitForClean(opCtx, nss, footprint);
+}
 
+void MigrationDestinationManager::_forgetReceive(OperationContext* opCtx,
+                                                 const NamespaceString& nss,
+                                                 const BSONObj& min,
+                                                 const BSONObj& max) {
+    AutoGetCollection autoColl(opCtx, nss, MODE_IX, MODE_X);
+    if (autoColl.getCollection() == nullptr) {
+        return;
+    }
     auto css = CollectionShardingState::get(opCtx, nss);
     auto metadata = css->getMetadata();
-
-    // This can currently happen because drops aren't synchronized with in-migrations. The idea
-    // for checking this here is that in the future we shouldn't have this problem.
-    if (!metadata || metadata->getCollVersion().epoch() != epoch) {
-        return {ErrorCodes::StaleShardVersion,
-                str::stream() << "no need to forget pending chunk "
-                              << "["
-                              << min
-                              << ","
-                              << max
-                              << ")"
-                              << " because the epoch for "
-                              << nss.ns()
-                              << " has changed from "
-                              << epoch
-                              << " to "
-                              << (metadata ? metadata->getCollVersion().epoch()
-                                           : ChunkVersion::UNSHARDED().epoch())};
-    }
-
     css->forgetReceive(ChunkRange(min, max));
-
-    return Status::OK();
 }
 
 }  // namespace mongo

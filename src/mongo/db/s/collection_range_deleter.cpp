@@ -33,6 +33,7 @@
 #include "mongo/db/s/collection_range_deleter.h"
 
 #include <algorithm>
+#include <utility>
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/client.h"
@@ -41,13 +42,16 @@
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/keypattern.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/metadata_manager.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/util/log.h"
@@ -57,7 +61,6 @@
 namespace mongo {
 
 class ChunkRange;
-class OldClientWriteContext;
 
 using CallbackArgs = executor::TaskExecutor::CallbackArgs;
 using logger::LogComponent;
@@ -67,62 +70,39 @@ namespace {
 const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
                                                 WriteConcernOptions::SyncMode::UNSET,
                                                 Seconds(60));
-
 }  // unnamed namespace
 
-CollectionRangeDeleter::CollectionRangeDeleter(NamespaceString nss) : _nss(std::move(nss)) {}
-
-void CollectionRangeDeleter::run() {
-    Client::initThread(getThreadName());
-    ON_BLOCK_EXIT([&] { Client::destroy(); });
-    auto opCtx = cc().makeOperationContext().get();
-
-    const int maxToDelete = std::max(int(internalQueryExecYieldIterations.load()), 1);
-    bool hasNextRangeToClean = cleanupNextRange(opCtx, maxToDelete);
-
-    // If there are more ranges to run, we add <this> back onto the task executor to run again.
-    if (hasNextRangeToClean) {
-        auto executor = ShardingState::get(opCtx)->getRangeDeleterTaskExecutor();
-        executor->scheduleWork([this](const CallbackArgs& cbArgs) { run(); });
-    } else {
-        delete this;
-    }
+CollectionRangeDeleter::~CollectionRangeDeleter() {
+    clear();  // notify anybody sleeping on orphan ranges
 }
 
-bool CollectionRangeDeleter::cleanupNextRange(OperationContext* opCtx, int maxToDelete) {
-
-    {
-        AutoGetCollection autoColl(opCtx, _nss, MODE_IX);
-        auto* collection = autoColl.getCollection();
-        if (!collection) {
-            return false;
+// This function runs in range deleter's task executor thread.
+// call under a collection lock
+bool CollectionRangeDeleter::cleanUpNextRange(OperationContext* opCtx,
+                                              Collection* collection,
+                                              BSONObj const& keyPattern,
+                                              stdx::mutex* lock,
+                                              int maxToDelete) {
+    dassert(collection != nullptr);
+    auto range = [lock, this]() -> boost::optional<ChunkRange> {
+        stdx::lock_guard<stdx::mutex> lk(*lock);
+        if (this->isEmpty()) {
+            return boost::none;
+        } else {
+            return this->_orphans.front().range;
         }
-        auto* collectionShardingState = CollectionShardingState::get(opCtx, _nss);
-        dassert(collectionShardingState != nullptr);  // every collection gets one
+    }();
+    if (!range) {
+        return false;
+    }
 
-        auto& metadataManager = collectionShardingState->_metadataManager;
-
-        if (!_rangeInProgress && !metadataManager.hasRangesToClean()) {
-            // Nothing left to do
-            return false;
+    auto countWith = _doDeletion(opCtx, collection, keyPattern, *range, maxToDelete);
+    if (!countWith.isOK() || countWith.getValue() == 0) {
+        {
+            stdx::lock_guard<stdx::mutex> scopedLock(*lock);
+            _pop(countWith.getStatus());
         }
-
-        if (!_rangeInProgress || !metadataManager.isInRangesToClean(_rangeInProgress.get())) {
-            // No valid chunk in progress, get a new one
-            if (!metadataManager.hasRangesToClean()) {
-                return false;
-            }
-            _rangeInProgress = metadataManager.getNextRangeToClean();
-        }
-
-        auto scopedCollectionMetadata = collectionShardingState->getMetadata();
-        int numDocumentsDeleted =
-            _doDeletion(opCtx, collection, scopedCollectionMetadata->getKeyPattern(), maxToDelete);
-        if (numDocumentsDeleted <= 0) {
-            metadataManager.removeRangeToClean(_rangeInProgress.get());
-            _rangeInProgress = boost::none;
-            return metadataManager.hasRangesToClean();
-        }
+        return true;
     }
 
     // wait for replication
@@ -131,59 +111,63 @@ bool CollectionRangeDeleter::cleanupNextRange(OperationContext* opCtx, int maxTo
     Status status =
         waitForWriteConcern(opCtx, currentClientOpTime, kMajorityWriteConcern, &wcResult);
     if (!status.isOK()) {
-        warning() << "Error when waiting for write concern after removing chunks in " << _nss
-                  << " : " << status.reason();
+        warning() << "Error when waiting for write concern after removing chunks in "
+                  << collection->ns() << " : " << status.reason();
+        {
+            stdx::lock_guard<stdx::mutex> scopedLock(*lock);
+            _pop(status);
+        }
     }
-
     return true;
 }
 
-int CollectionRangeDeleter::_doDeletion(OperationContext* opCtx,
-                                        Collection* collection,
-                                        const BSONObj& keyPattern,
-                                        int maxToDelete) {
-    invariant(_rangeInProgress);
-    invariant(collection);
+// This function runs in range deleter task executor thread..
+// call under collection lock
+StatusWith<int> CollectionRangeDeleter::_doDeletion(OperationContext* opCtx,
+                                                    Collection* collection,
+                                                    BSONObj const& keyPattern,
+                                                    ChunkRange const& range,
+                                                    int maxToDelete) {
+    NamespaceString const& nss = collection->ns();
 
     // The IndexChunk has a keyPattern that may apply to more than one index - we need to
     // select the index and get the full index keyPattern here.
-    const IndexDescriptor* idx =
-        collection->getIndexCatalog()->findShardKeyPrefixedIndex(opCtx, keyPattern, false);
+    auto catalog = collection->getIndexCatalog();
+    const IndexDescriptor* idx = catalog->findShardKeyPrefixedIndex(opCtx, keyPattern, false);
     if (idx == NULL) {
-        warning() << "Unable to find shard key index for " << keyPattern.toString() << " in "
-                  << _nss;
-        return -1;
+        std::string msg = str::stream() << "Unable to find shard key index for "
+                                        << keyPattern.toString() << " in " << nss.ns();
+        log() << msg;
+        return {ErrorCodes::InternalError, msg};
     }
 
-    KeyPattern indexKeyPattern(idx->keyPattern().getOwned());
-
     // Extend bounds to match the index we found
-    const BSONObj& min =
-        Helpers::toKeyFormat(indexKeyPattern.extendRangeBound(_rangeInProgress->getMin(), false));
-    const BSONObj& max =
-        Helpers::toKeyFormat(indexKeyPattern.extendRangeBound(_rangeInProgress->getMax(), false));
+    KeyPattern indexKeyPattern(idx->keyPattern().getOwned());
+    auto extend = [&](auto& key) {
+        return Helpers::toKeyFormat(indexKeyPattern.extendRangeBound(key, false));
+    };
+    const BSONObj& min = extend(range.getMin());
+    const BSONObj& max = extend(range.getMax());
 
-    LOG(1) << "begin removal of " << min << " to " << max << " in " << _nss;
+    LOG(1) << "begin removal of " << min << " to " << max << " in " << nss.ns();
 
     auto indexName = idx->indexName();
-    IndexDescriptor* desc = collection->getIndexCatalog()->findIndexByName(opCtx, indexName);
-    if (!desc) {
-        warning() << "shard key index with name " << indexName << " on '" << _nss
-                  << "' was dropped";
-        return -1;
+    IndexDescriptor* descriptor = collection->getIndexCatalog()->findIndexByName(opCtx, indexName);
+    if (!descriptor) {
+        std::string msg = str::stream() << "shard key index with name " << indexName << " on '"
+                                        << nss.ns() << "' was dropped";
+        log() << msg;
+        return {ErrorCodes::InternalError, msg};
     }
 
     int numDeleted = 0;
     do {
-        auto exec = InternalPlanner::indexScan(opCtx,
-                                               collection,
-                                               desc,
-                                               min,
-                                               max,
-                                               BoundInclusion::kIncludeStartKeyOnly,
-                                               PlanExecutor::YIELD_MANUAL,
-                                               InternalPlanner::FORWARD,
-                                               InternalPlanner::IXSCAN_FETCH);
+        auto bounds = BoundInclusion::kIncludeStartKeyOnly;
+        auto manual = PlanExecutor::YIELD_MANUAL;
+        auto forward = InternalPlanner::FORWARD;
+        auto fetch = InternalPlanner::IXSCAN_FETCH;
+        auto exec = InternalPlanner::indexScan(
+            opCtx, collection, descriptor, min, max, bounds, manual, forward, fetch);
         RecordId rloc;
         BSONObj obj;
         PlanExecutor::ExecState state = exec->getNext(&obj, &rloc);
@@ -193,23 +177,66 @@ int CollectionRangeDeleter::_doDeletion(OperationContext* opCtx,
         if (state == PlanExecutor::FAILURE || state == PlanExecutor::DEAD) {
             warning(LogComponent::kSharding)
                 << PlanExecutor::statestr(state) << " - cursor error while trying to delete " << min
-                << " to " << max << " in " << _nss << ": " << WorkingSetCommon::toStatusString(obj)
+                << " to " << max << " in " << nss << ": " << WorkingSetCommon::toStatusString(obj)
                 << ", stats: " << Explain::getWinningPlanStats(exec.get());
             break;
         }
 
         invariant(PlanExecutor::ADVANCED == state);
         WriteUnitOfWork wuow(opCtx);
-        if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(opCtx, _nss)) {
-            warning() << "stepped down from primary while deleting chunk; orphaning data in "
-                      << _nss << " in range [" << min << ", " << max << ")";
-            break;
-        }
-        OpDebug* const nullOpDebug = nullptr;
-        collection->deleteDocument(opCtx, rloc, nullOpDebug, true);
+        collection->deleteDocument(opCtx, rloc, nullptr, true);
         wuow.commit();
     } while (++numDeleted < maxToDelete);
     return numDeleted;
+}
+
+auto CollectionRangeDeleter::overlaps(ChunkRange const& range) -> DeleteNotification {
+    // start search with newest entries by using reverse iterators
+    auto it = find_if(_orphans.rbegin(), _orphans.rend(), [&](auto& cleanee) {
+        return bool(cleanee.range.overlapWith(range));
+    });
+    return it != _orphans.rend() ? it->notification : DeleteNotification();
+}
+
+void CollectionRangeDeleter::add(ChunkRange const& range) {
+    // We ignore the case of overlapping, or even equal, ranges.
+
+    // Deleting overlapping ranges is similarly quick.
+    _orphans.emplace_back(Deletion{ChunkRange(range.getMin().getOwned(), range.getMax().getOwned()),
+                                   std::make_shared<Notification<Status>>()});
+}
+
+void CollectionRangeDeleter::append(BSONObjBuilder* builder) const {
+    BSONArrayBuilder arr(builder->subarrayStart("rangesToClean"));
+    for (auto const& entry : _orphans) {
+        BSONObjBuilder obj;
+        entry.range.append(&obj);
+        arr.append(obj.done());
+    }
+    arr.done();
+}
+
+size_t CollectionRangeDeleter::size() const {
+    return _orphans.size();
+}
+
+bool CollectionRangeDeleter::isEmpty() const {
+    return _orphans.empty();
+}
+
+void CollectionRangeDeleter::clear() {
+    std::for_each(_orphans.begin(), _orphans.end(), [](auto& range) {
+        // Since deletion was not actually tried, we have no failures to report.
+        if (!*(range.notification)) {
+            range.notification->set(Status::OK());  // wake up anything waiting on it
+        }
+    });
+    _orphans.clear();
+}
+
+void CollectionRangeDeleter::_pop(Status result) {
+    _orphans.front().notification->set(result);  // wake up waitForClean
+    _orphans.pop_front();
 }
 
 }  // namespace mongo
