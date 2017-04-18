@@ -1,0 +1,22 @@
+
+This document introduce how to build build mongod on CentOS 7
+
+
+Prerequisite£º
+1£¬ Upload the source code to your CentOS 7 for compiling
+2£¬ Check CentOS 7  gcc compiler, should be new than 4.8.5       
+       [root@Dev-VM-87 ~]# gcc --version
+       gcc (GCC) 4.8.5 20150623 (Red Hat 4.8.5-11)
+       Copyright (C) 2015 Free Software Foundation, Inc.
+       This is free software; see the source for copying conditions. There is NO
+       warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+       If gcc is not installed yet£¬ use yum group install "Development Tools" to install first
+3£¬ check if OpenSSL1.01, Scons 2.3.0, Python 2.7 are installed or not, install if not.
+ 
+Compile£º
+1£¬ use root user login, change to mongodb-src-r3.2.5 directory
+2£¬ Run the following command£º
+      [root@Dev-VM-xx mongodb-src-r3.2.5]# scons all -j 80 --ssl --disable-warnings-as-errors
+3£¬ Strip extra symbol
+     [root@Dev-VM-xx mongodb-src-r3.2.5]# strip --strip-unneeded mongo*
+4£¬ Copy mongo, mongod, mongos to the directory you need, done.
