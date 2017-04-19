@@ -1,0 +1,9 @@
+Import("env")
+
+env = env.Clone()
+
+
+env.Library(
+	target="dmidecode", 
+	source=[ "dmidecode.cpp", "dmioem.cpp", "util.cpp" ]
+)
