@@ -38,7 +38,6 @@
 #include "mongo/db/stats/top.h"
 #include "mongo/db/commands.h"
 #include "mongo/util/dmidecode/dmidecode.h"
-#include "mongo/util/dmidecode/util.h"
 namespace {
 
 using namespace mongo;

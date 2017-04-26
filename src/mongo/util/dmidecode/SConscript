@@ -2,8 +2,13 @@ Import("env")
 
 env = env.Clone()
 
-
-env.Library(
-	target="dmidecode", 
-	source=[ "dmidecode.cpp", "dmioem.cpp", "util.cpp" ]
-)
+if env.TargetOSIs('windows'):
+	env.Library(
+		target="dmidecode", 
+		source=[ "dmidecode_win.cpp" ]
+	)
+else:
+	env.Library(
+		target="dmidecode", 
+		source=[ "dmidecode.cpp" ]
+	)
